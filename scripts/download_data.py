@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import tarfile
 import sys
 from pathlib import Path
 from urllib import error, parse, request
@@ -132,6 +133,12 @@ def resolve_output_path(
     return Path(filename)
 
 
+def resolve_extraction_dir(destination: Path, output_dir: str | None) -> Path:
+    if output_dir:
+        return Path(output_dir)
+    return destination.parent
+
+
 def resolve_api_key(api_key: str | None) -> str:
     if api_key:
         key = api_key.strip()
@@ -176,6 +183,117 @@ def parse_expected_checksum(checksum: str | None) -> tuple[str | None, str | Non
     return algorithm.lower(), digest.lower()
 
 
+def get_tar_members_with_optional_root_strip(archive: tarfile.TarFile) -> list[tuple[tarfile.TarInfo, Path]]:
+    members = archive.getmembers()
+    normalized_parts: list[tuple[tarfile.TarInfo, tuple[str, ...]]] = []
+    for member in members:
+        member_path = Path(member.name)
+        if member_path.is_absolute():
+            raise DownloadError(f"壓縮檔內含絕對路徑，已拒絕解壓：{member.name}")
+        parts = tuple(part for part in member_path.parts if part not in ("", "."))
+        if any(part == ".." for part in parts):
+            raise DownloadError(f"壓縮檔內含可疑路徑，已拒絕解壓：{member.name}")
+        normalized_parts.append((member, parts))
+
+    root_name: str | None = None
+    has_root_file = False
+    for _, parts in normalized_parts:
+        if not parts:
+            continue
+        if len(parts) == 1:
+            has_root_file = True
+            break
+        if root_name is None:
+            root_name = parts[0]
+        elif root_name != parts[0]:
+            root_name = ""
+            break
+
+    strip_root = bool(root_name) and not has_root_file
+
+    resolved: list[tuple[tarfile.TarInfo, Path]] = []
+    for member, parts in normalized_parts:
+        if not parts:
+            continue
+        if strip_root and parts[0] == root_name:
+            parts = parts[1:]
+        if not parts:
+            continue
+        resolved.append((member, Path(*parts)))
+    return resolved
+
+
+def extract_archive(archive_path: Path, target_dir: Path, overwrite: bool) -> None:
+    if not archive_path.exists():
+        raise DownloadError(f"找不到要解壓的壓縮檔：{archive_path}")
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with tarfile.open(archive_path, mode="r:*") as archive:
+            members = get_tar_members_with_optional_root_strip(archive)
+            total_bytes = sum(member.size for member, _ in members if member.isfile())
+            extracted_bytes = 0
+            last_percent = -1
+
+            def report_progress() -> None:
+                nonlocal last_percent
+                if total_bytes <= 0:
+                    return
+                percent = int(extracted_bytes * 100 / total_bytes)
+                if percent != last_percent:
+                    print(
+                        f"\r  解壓進度：{format_size(extracted_bytes)} / {format_size(total_bytes)} "
+                        f"({percent}%)",
+                        end="",
+                        flush=True,
+                    )
+                    last_percent = percent
+
+            print("開始解壓縮...")
+            for member, relative_path in members:
+                destination = target_dir / relative_path
+                resolved_destination = destination.resolve(strict=False)
+                resolved_target = target_dir.resolve(strict=False)
+                if resolved_target != resolved_destination and resolved_target not in resolved_destination.parents:
+                    raise DownloadError(f"解壓路徑超出目標資料夾：{member.name}")
+
+                if member.isdir():
+                    destination.mkdir(parents=True, exist_ok=True)
+                    continue
+
+                if member.issym() or member.islnk():
+                    raise DownloadError(f"壓縮檔內含連結檔案，已拒絕解壓：{member.name}")
+
+                if member.isfile():
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    if destination.exists():
+                        if not overwrite:
+                            raise DownloadError(f"檔案已存在，請加上 --overwrite：{destination}")
+                        if destination.is_dir():
+                            raise DownloadError(f"目標位置已存在且是資料夾，無法覆蓋：{destination}")
+                        destination.unlink()
+                    with archive.extractfile(member) as source, destination.open("wb") as out:
+                        if source is None:
+                            raise DownloadError(f"無法讀取壓縮檔內的檔案：{member.name}")
+                        while True:
+                            chunk = source.read(CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            out.write(chunk)
+                            extracted_bytes += len(chunk)
+                            report_progress()
+                    continue
+
+                raise DownloadError(f"不支援的壓縮檔項目：{member.name}")
+    except tarfile.TarError as exc:
+        raise DownloadError(f"解壓縮失敗：{exc}") from exc
+
+    if total_bytes > 0:
+        print()
+    archive_path.unlink()
+
+
 def download_file(
     download_url: str,
     destination: Path,
@@ -185,8 +303,6 @@ def download_file(
     overwrite: bool,
 ) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists() and not overwrite:
-        raise DownloadError(f"輸出檔已存在，請加上 --overwrite 或改用其他路徑：{destination}")
 
     temp_path = destination.with_name(destination.name + ".part")
     if temp_path.exists():
@@ -256,6 +372,28 @@ def download_file(
     temp_path.replace(destination)
 
 
+def download_or_reuse_archive(
+    download_url: str,
+    destination: Path,
+    expected_size: int | None,
+    expected_checksum: str | None,
+    timeout: int,
+    overwrite: bool,
+) -> None:
+    if destination.exists() and not overwrite:
+        print(f"已存在壓縮檔，略過下載：{destination}")
+        return
+
+    download_file(
+        download_url=download_url,
+        destination=destination,
+        expected_size=expected_size,
+        expected_checksum=expected_checksum,
+        timeout=timeout,
+        overwrite=overwrite,
+    )
+
+
 def main() -> int:
     args = parse_args()
 
@@ -281,7 +419,7 @@ def main() -> int:
         if expected_size is not None:
             print(f"預估大小：{format_size(expected_size)}")
 
-        download_file(
+        download_or_reuse_archive(
             download_url=download_url,
             destination=destination,
             expected_size=expected_size,
@@ -289,11 +427,14 @@ def main() -> int:
             timeout=args.timeout,
             overwrite=args.overwrite,
         )
+
+        extraction_dir = resolve_extraction_dir(destination, args.output_dir)
+        extract_archive(destination, extraction_dir, args.overwrite)
     except DownloadError as exc:
         print(f"錯誤：{exc}", file=sys.stderr)
         return 1
 
-    print(f"完成：{destination}")
+    print(f"完成：{extraction_dir}")
     return 0
 
 

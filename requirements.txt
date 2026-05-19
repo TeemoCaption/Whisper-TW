@@ -1,0 +1,7 @@
+torch
+torchaudio
+transformers
+sentencepiece
+PyYAML
+pypinyin
+wandb
