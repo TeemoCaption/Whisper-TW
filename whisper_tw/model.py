@@ -12,6 +12,8 @@ from transformers import WhisperModel
 class WhisperTWOutput:
     loss: torch.Tensor | None
     text_loss: torch.Tensor | None
+    text_ctc_loss: torch.Tensor | None
+    correction_loss: torch.Tensor | None
     bopomofo_ctc_loss: torch.Tensor | None
     logits: torch.Tensor
     bopomofo_logits: torch.Tensor
@@ -123,6 +125,7 @@ class ContextCorrector(nn.Module):
     def __init__(
         self,
         vocab_size: int,
+        pad_id: int,
         hidden_size: int,
         num_layers: int,
         num_heads: int,
@@ -131,7 +134,15 @@ class ContextCorrector(nn.Module):
     ) -> None:
         super().__init__()
         self.max_target_length = max_target_length
-        self.query_embedding = nn.Embedding(max_target_length, hidden_size)
+        self.pad_id = pad_id
+        self.token_embedding = nn.Embedding(
+            vocab_size,
+            hidden_size,
+            padding_idx=pad_id,
+        )
+        self.position_embedding = nn.Embedding(max_target_length, hidden_size)
+        self.input_norm = nn.LayerNorm(hidden_size)
+        self.dropout = nn.Dropout(dropout)
         self.layers = nn.ModuleList(
             [
                 GatedCorrectionLayer(
@@ -147,20 +158,20 @@ class ContextCorrector(nn.Module):
 
     def forward(
         self,
+        draft_token_ids: torch.Tensor,
         audio_memory: torch.Tensor,
         bopomofo_memory: torch.Tensor,
-        target_length: int,
     ) -> torch.Tensor:
-        target_length = min(target_length, self.max_target_length)
+        target_length = min(draft_token_ids.size(1), self.max_target_length)
+        draft_token_ids = draft_token_ids[:, :target_length]
         positions = torch.arange(
             target_length,
             device=audio_memory.device,
         )
-        token_states = self.query_embedding(positions).unsqueeze(0).expand(
-            audio_memory.size(0),
-            -1,
-            -1,
-        )
+        token_states = self.token_embedding(draft_token_ids) + self.position_embedding(
+            positions
+        ).unsqueeze(0)
+        token_states = self.dropout(self.input_norm(token_states))
         for layer in self.layers:
             token_states = layer(
                 token_states=token_states,
@@ -169,12 +180,28 @@ class ContextCorrector(nn.Module):
             )
         return self.output_head(self.norm(token_states))
 
+    def fit_length(self, token_ids: torch.Tensor, target_length: int) -> torch.Tensor:
+        target_length = min(target_length, self.max_target_length)
+        if token_ids.size(1) == target_length:
+            return token_ids
+        if token_ids.size(1) > target_length:
+            return token_ids[:, :target_length]
+        padding = torch.full(
+            (token_ids.size(0), target_length - token_ids.size(1)),
+            self.pad_id,
+            dtype=token_ids.dtype,
+            device=token_ids.device,
+        )
+        return torch.cat([token_ids, padding], dim=1)
+
 
 class WhisperTWModel(nn.Module):
     def __init__(
         self,
         config: dict[str, Any],
         vocab_size: int,
+        text_ctc_vocab_size: int,
+        text_ctc_pad_id: int,
         bopomofo_vocab_size: int,
         text_pad_id: int,
     ) -> None:
@@ -184,14 +211,21 @@ class WhisperTWModel(nn.Module):
         acoustic_cfg = model_cfg["acoustic_encoder"]
         compressor_cfg = model_cfg["acoustic_compressor"]
         corrector_cfg = model_cfg["context_corrector"]
+        text_ctc_cfg = model_cfg.get("text_ctc", {})
         ctc_cfg = model_cfg["bopomofo_ctc"]
 
         self.text_pad_id = text_pad_id
+        self.text_ctc_pad_id = text_ctc_pad_id
+        tokenizer_cfg = config.get("tokenizer", {})
+        self.text_bos_id = int(tokenizer_cfg.get("bos_id", -1))
+        self.text_eos_id = int(tokenizer_cfg.get("eos_id", -1))
         self.ctc_enabled = bool(ctc_cfg.get("enabled", True))
         self.ctc_weight = float(ctc_cfg.get("loss_weight", 0.3))
         self.text_loss_weight = float(train_cfg.get("text_loss_weight", 1.0))
         self.text_label_smoothing = float(train_cfg.get("text_label_smoothing", 0.0))
         self.correction_weight = float(corrector_cfg.get("loss_weight", 0.2))
+        self.correction_uses_ctc_draft = bool(corrector_cfg.get("use_ctc_draft", True))
+        self.correction_input_dropout = float(corrector_cfg.get("input_dropout", 0.0))
 
         self.whisper = WhisperModel.from_pretrained(model_cfg["whisper_name"])
         whisper_hidden = self.whisper.config.d_model
@@ -223,7 +257,9 @@ class WhisperTWModel(nn.Module):
         )
         self.acoustic_norm = nn.LayerNorm(acoustic_hidden)
 
-        self.text_ctc_head = nn.Linear(acoustic_hidden, vocab_size)
+        text_ctc_dropout = float(text_ctc_cfg.get("dropout", 0.0))
+        self.text_ctc_dropout = nn.Dropout(text_ctc_dropout)
+        self.text_ctc_head = nn.Linear(acoustic_hidden, text_ctc_vocab_size)
         self.bopomofo_head = nn.Linear(acoustic_hidden, bopomofo_vocab_size)
         self.bopomofo_token_embedding = nn.Embedding(
             bopomofo_vocab_size,
@@ -249,7 +285,8 @@ class WhisperTWModel(nn.Module):
         self.audio_memory_projection = nn.Linear(acoustic_hidden, corrector_hidden)
         self.bopomofo_memory_projection = nn.Linear(acoustic_hidden, corrector_hidden)
         self.corrector = ContextCorrector(
-            vocab_size=vocab_size,
+            vocab_size=text_ctc_vocab_size,
+            pad_id=text_ctc_pad_id,
             hidden_size=corrector_hidden,
             num_layers=int(corrector_cfg["num_layers"]),
             num_heads=int(corrector_cfg["num_heads"]),
@@ -262,6 +299,7 @@ class WhisperTWModel(nn.Module):
         input_features: torch.Tensor,
         decoder_input_ids: torch.Tensor,
         labels: torch.Tensor | None = None,
+        text_ctc_labels: torch.Tensor | None = None,
         bopomofo_labels: torch.Tensor | None = None,
         bopomofo_label_lengths: torch.Tensor | None = None,
     ) -> WhisperTWOutput:
@@ -274,7 +312,7 @@ class WhisperTWModel(nn.Module):
         )
 
         bopomofo_logits = self.bopomofo_head(acoustic_hidden)
-        text_ctc_logits = self.text_ctc_head(acoustic_hidden)
+        text_ctc_logits = self.text_ctc_head(self.text_ctc_dropout(acoustic_hidden))
         bopomofo_probs = bopomofo_logits.softmax(dim=-1)
         bopomofo_context = torch.matmul(
             bopomofo_probs,
@@ -286,34 +324,53 @@ class WhisperTWModel(nn.Module):
         bopomofo_memory = self.bopomofo_memory_projection(
             self.bopomofo_compressor(bopomofo_context)
         )
-        target_length = decoder_input_ids.size(1)
-        if labels is not None:
+        if text_ctc_labels is not None:
+            target_length = text_ctc_labels.size(1)
+        elif labels is not None:
             target_length = labels.size(1)
+        else:
+            target_length = decoder_input_ids.size(1)
+        target_length = min(target_length, self.corrector.max_target_length)
+        correction_input_ids = self._build_correction_draft(
+            text_ctc_logits=text_ctc_logits,
+            text_ctc_labels=text_ctc_labels,
+            target_length=target_length,
+        )
         logits = self.corrector(
+            draft_token_ids=correction_input_ids,
             audio_memory=audio_memory,
             bopomofo_memory=bopomofo_memory,
-            target_length=target_length,
         )
 
         text_loss = None
-        if labels is not None:
-            target_lengths = (labels != self.text_pad_id).sum(dim=1)
+        text_ctc_loss = None
+        correction_loss = None
+        if text_ctc_labels is not None:
+            text_ctc_targets, target_lengths = self._build_text_ctc_targets(
+                text_ctc_labels
+            )
             text_ctc_loss = nn.functional.ctc_loss(
                 log_probs=text_ctc_logits.log_softmax(dim=-1).transpose(0, 1),
-                targets=labels,
+                targets=text_ctc_targets,
                 input_lengths=ctc_input_lengths,
                 target_lengths=target_lengths,
-                blank=self.text_pad_id,
+                blank=self.text_ctc_pad_id,
                 zero_infinity=True,
             )
-            correction_labels = labels[:, : logits.size(1)]
+        if text_ctc_labels is not None:
+            correction_labels = self.corrector.fit_length(
+                text_ctc_labels,
+                logits.size(1),
+            )
             correction_loss = nn.functional.cross_entropy(
                 logits.reshape(-1, logits.size(-1)),
                 correction_labels.reshape(-1),
-                ignore_index=self.text_pad_id,
                 label_smoothing=self.text_label_smoothing,
             )
-            text_loss = text_ctc_loss + self.correction_weight * correction_loss
+        if text_ctc_loss is not None:
+            text_loss = text_ctc_loss
+            if correction_loss is not None:
+                text_loss = text_loss + self.correction_weight * correction_loss
 
         ctc_loss = None
         if (
@@ -340,10 +397,85 @@ class WhisperTWModel(nn.Module):
         return WhisperTWOutput(
             loss=loss,
             text_loss=text_loss,
+            text_ctc_loss=text_ctc_loss,
+            correction_loss=correction_loss,
             bopomofo_ctc_loss=ctc_loss,
             logits=logits,
             bopomofo_logits=bopomofo_logits,
         )
+
+    def _build_text_ctc_targets(
+        self, labels: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        valid_mask = labels != self.text_ctc_pad_id
+        target_lengths = valid_mask.sum(dim=1)
+        target_chunks = [row[mask] for row, mask in zip(labels, valid_mask)]
+        if target_chunks:
+            targets = torch.cat(target_chunks)
+        else:
+            targets = labels.new_empty((0,))
+        return targets, target_lengths
+
+    def _build_correction_draft(
+        self,
+        text_ctc_logits: torch.Tensor,
+        text_ctc_labels: torch.Tensor | None,
+        target_length: int,
+    ) -> torch.Tensor:
+        if self.correction_uses_ctc_draft:
+            draft_ids = self._collapse_ctc_token_ids(
+                text_ctc_logits.detach().argmax(dim=-1),
+                max_new_tokens=target_length,
+            )
+        elif text_ctc_labels is not None:
+            draft_ids = text_ctc_labels
+        else:
+            draft_ids = self._collapse_ctc_token_ids(
+                text_ctc_logits.detach().argmax(dim=-1),
+                max_new_tokens=target_length,
+            )
+        draft_ids = self.corrector.fit_length(draft_ids, target_length)
+        if not self.training or self.correction_input_dropout <= 0.0:
+            return draft_ids
+        valid_mask = draft_ids != self.text_ctc_pad_id
+        dropout_mask = torch.rand(
+            draft_ids.shape,
+            device=draft_ids.device,
+        ) < self.correction_input_dropout
+        draft_ids = draft_ids.masked_fill(valid_mask & dropout_mask, self.text_ctc_pad_id)
+        return draft_ids
+
+    def _collapse_ctc_token_ids(
+        self,
+        token_ids: torch.Tensor,
+        max_new_tokens: int,
+    ) -> torch.Tensor:
+        decoded: list[list[int]] = []
+        for sample_ids in token_ids.tolist():
+            collapsed: list[int] = []
+            previous_id: int | None = None
+            for token_id in sample_ids:
+                if token_id != self.text_ctc_pad_id and token_id != previous_id:
+                    collapsed.append(token_id)
+                    if len(collapsed) >= max_new_tokens:
+                        break
+                previous_id = token_id
+            decoded.append(collapsed or [self.text_ctc_pad_id])
+
+        output_length = max(len(ids) for ids in decoded)
+        generated = torch.full(
+            (len(decoded), output_length),
+            self.text_ctc_pad_id,
+            dtype=torch.long,
+            device=token_ids.device,
+        )
+        for index, ids in enumerate(decoded):
+            generated[index, : len(ids)] = torch.tensor(
+                ids,
+                dtype=torch.long,
+                device=token_ids.device,
+            )
+        return generated
 
     def _encode_feature_sequence(self, input_features: torch.Tensor) -> torch.Tensor:
         hidden = self.whisper.encoder(input_features).last_hidden_state
@@ -352,41 +484,45 @@ class WhisperTWModel(nn.Module):
         return self.acoustic_norm(hidden)
 
     @torch.no_grad()
-    def generate_greedy(
+    def generate_ctc_greedy(
         self,
         input_features: torch.Tensor,
-        bos_id: int,
-        eos_id: int,
         max_new_tokens: int,
     ) -> torch.Tensor:
         self.eval()
         acoustic_hidden = self._encode_feature_sequence(input_features)
         token_ids = self.text_ctc_head(acoustic_hidden).argmax(dim=-1)
-        decoded: list[list[int]] = []
-        for sample_ids in token_ids.tolist():
-            collapsed: list[int] = [bos_id]
-            previous_id: int | None = None
-            for token_id in sample_ids:
-                if token_id != self.text_pad_id and token_id != previous_id:
-                    collapsed.append(token_id)
-                    if len(collapsed) >= max_new_tokens + 1:
-                        break
-                previous_id = token_id
-            if collapsed[-1] != eos_id and len(collapsed) < max_new_tokens + 1:
-                collapsed.append(eos_id)
-            decoded.append(collapsed)
+        return self._collapse_ctc_token_ids(token_ids, max_new_tokens)
 
-        output_length = max(len(ids) for ids in decoded)
-        generated = torch.full(
-            (len(decoded), output_length),
-            self.text_pad_id,
-            dtype=torch.long,
-            device=input_features.device,
+    @torch.no_grad()
+    def generate_ctc_corrected(
+        self,
+        input_features: torch.Tensor,
+        max_new_tokens: int,
+    ) -> torch.Tensor:
+        self.eval()
+        acoustic_hidden = self._encode_feature_sequence(input_features)
+        text_ctc_logits = self.text_ctc_head(acoustic_hidden)
+        draft_ids = self._collapse_ctc_token_ids(
+            text_ctc_logits.argmax(dim=-1),
+            max_new_tokens=max_new_tokens,
         )
-        for index, ids in enumerate(decoded):
-            generated[index, : len(ids)] = torch.tensor(
-                ids,
-                dtype=torch.long,
-                device=input_features.device,
-            )
-        return generated
+        draft_ids = self.corrector.fit_length(draft_ids, max_new_tokens)
+        bopomofo_logits = self.bopomofo_head(acoustic_hidden)
+        bopomofo_probs = bopomofo_logits.softmax(dim=-1)
+        bopomofo_context = torch.matmul(
+            bopomofo_probs,
+            self.bopomofo_token_embedding.weight,
+        )
+        audio_memory = self.audio_memory_projection(
+            self.audio_compressor(acoustic_hidden)
+        )
+        bopomofo_memory = self.bopomofo_memory_projection(
+            self.bopomofo_compressor(bopomofo_context)
+        )
+        logits = self.corrector(
+            draft_token_ids=draft_ids,
+            audio_memory=audio_memory,
+            bopomofo_memory=bopomofo_memory,
+        )
+        return logits.argmax(dim=-1)

@@ -11,11 +11,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from whisper_tw.config import load_config
+from whisper_tw.config import load_config, resolve_common_voice_split_source
 from whisper_tw.data import (
     build_audio_augmentor,
     precompute_feature_cache,
-    resolve_common_voice_split_source,
 )
 
 

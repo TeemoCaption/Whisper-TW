@@ -22,3 +22,24 @@ def resolve_device(config: dict[str, Any]) -> str:
     if device != "auto":
         return str(device)
     return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def resolve_common_voice_split_source(
+    data_cfg: dict[str, Any],
+    split: str,
+) -> str | Path:
+    split_paths = data_cfg.get("split_paths", {})
+    if isinstance(split_paths, dict):
+        split_source = split_paths.get(split)
+        if split_source:
+            return split_source
+
+    split_tsv_key = f"{split}_tsv"
+    if data_cfg.get(split_tsv_key):
+        return data_cfg[split_tsv_key]
+
+    split_name_key = f"{split}_split"
+    if data_cfg.get(split_name_key):
+        return data_cfg[split_name_key]
+
+    return split

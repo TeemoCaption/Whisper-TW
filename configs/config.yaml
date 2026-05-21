@@ -38,6 +38,10 @@ tokenizer:
   bos_id: 2
   eos_id: 3
 
+character_vocab:
+  path: artifacts/tokenizer/char_zh_tw.txt
+  splits: [train, dev, test, validated]
+
 model:
   whisper_name: openai/whisper-medium
   freeze_whisper_encoder: true
@@ -60,13 +64,15 @@ model:
     dropout: 0.15
 
   context_corrector:
-    output_type: plain_chinese_text
+    output_type: ctc_draft_correction
     num_layers: 2
     num_heads: 8
     hidden_size: 512
     dropout: 0.3
     max_target_length: 256
-    loss_weight: 0.2
+    loss_weight: 0.25
+    use_ctc_draft: true
+    input_dropout: 0.1
 
 training:
   batch_size: 4
@@ -133,3 +139,7 @@ wandb:
 
 generation:
   max_new_tokens: 128
+
+evaluation:
+  output_dir: artifacts/eval
+  progress_update_every: 5

@@ -30,7 +30,7 @@ data:
     enabled: true
     root: artifacts/feature_cache_h100
     strict: true
-    train_variants: 4
+    train_variants: 8
 
 tokenizer:
   type: sentencepiece
@@ -43,14 +43,21 @@ tokenizer:
   bos_id: 2
   eos_id: 3
 
+character_vocab:
+  path: artifacts/tokenizer/char_zh_tw.txt
+  splits: [train, dev, test, validated]
+
 model:
   whisper_name: openai/whisper-medium
   freeze_whisper_encoder: true
-  unfreeze_encoder_last_n_layers: 4
+  unfreeze_encoder_last_n_layers: 8
 
   bopomofo_ctc:
     enabled: true
     loss_weight: 0.15
+
+  text_ctc:
+    dropout: 0.25
 
   acoustic_encoder:
     num_layers: 2
@@ -65,24 +72,34 @@ model:
     dropout: 0.1
 
   context_corrector:
-    output_type: plain_chinese_text
+    output_type: ctc_draft_correction
     num_layers: 2
     num_heads: 8
     hidden_size: 512
     dropout: 0.2
     max_target_length: 256
     loss_weight: 0.25
+    use_ctc_draft: true
+    input_dropout: 0.1
 
 training:
   batch_size: 96
   eval_batch_size: 256
   gradient_accumulation_steps: 1
-  learning_rate: 0.00025
-  encoder_learning_rate: 0.00002
-  weight_decay: 0.01
-  text_loss_weight: 0.85
-  text_label_smoothing: 0.02
-  num_epochs: 80
+  learning_rate: 0.0003
+  encoder_learning_rate: 0.00003
+  weight_decay: 0.015
+  text_loss_weight: 1.0
+  text_label_smoothing: 0.0
+  grad_clip_norm: 1.0
+  feature_spec_augment:
+    enabled: true
+    freq_masks: 2
+    max_freq_width: 8
+    time_masks: 2
+    max_time_width: 100
+    mask_value: 0.0
+  num_epochs: 30
   num_workers: 0
   prefetch_factor: 2
   eval_num_workers: 0
@@ -118,16 +135,13 @@ training:
     patience: 4
     min_delta: 0.005
   scheduler:
-    type: warmup_reduce_on_plateau
-    monitor: val_text_loss
+    type: warmup_cosine_restarts
+    monitor: val_text_ctc_loss
     warmup_epochs: 1
     warmup_start_factor: 0.3
-    factor: 0.5
-    patience: 2
-    threshold: 0.005
-    threshold_mode: abs
-    cooldown: 1
-    min_lr: 0.000001
+    t_0: 6
+    t_mult: 2
+    eta_min: 0.00001
 
 wandb:
   enabled: true
@@ -138,3 +152,7 @@ wandb:
 
 generation:
   max_new_tokens: 128
+
+evaluation:
+  output_dir: artifacts/eval
+  progress_update_every: 5

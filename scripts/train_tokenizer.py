@@ -9,8 +9,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from whisper_tw.config import load_config
-from whisper_tw.data import iter_tokenizer_sentences, resolve_common_voice_split_source
+from whisper_tw.config import load_config, resolve_common_voice_split_source
+from whisper_tw.data import iter_tokenizer_sentences
 from whisper_tw.tokenizer import train_sentencepiece_from_corpus
 
 

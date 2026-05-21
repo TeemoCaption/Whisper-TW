@@ -12,12 +12,12 @@ from tqdm.auto import tqdm
 from transformers import WhisperFeatureExtractor
 
 from .bopomofo import BopomofoVocab
-from .config import resolve_device
+from .char_vocab import CharacterVocab
+from .config import resolve_common_voice_split_source, resolve_device
 from .data import (
     CommonVoiceTaiwanDataset,
     WhisperTWCollator,
     build_audio_augmentor,
-    resolve_common_voice_split_source,
 )
 from .model import WhisperTWModel
 from .text_normalization import build_text_normalizer
@@ -149,6 +149,7 @@ def build_components(
     )
     tokenizer = SentencePieceTextTokenizer(config["tokenizer"]["model_path"])
     bopomofo_vocab = BopomofoVocab.default()
+    character_vocab = CharacterVocab.build_from_config(config)
     feature_extractor = WhisperFeatureExtractor.from_pretrained(
         config["model"]["whisper_name"]
     )
@@ -158,6 +159,7 @@ def build_components(
         split_source=split_source,
         text_tokenizer=tokenizer,
         bopomofo_vocab=bopomofo_vocab,
+        character_vocab=character_vocab,
         sample_rate=int(data_cfg.get("sample_rate", 16000)),
         max_audio_seconds=float(data_cfg.get("max_audio_seconds", 30.0)),
         max_samples=max_samples,
@@ -182,6 +184,7 @@ def build_components(
         feature_extractor=feature_extractor,
         text_pad_id=tokenizer.pad_id,
         bopomofo_pad_id=bopomofo_vocab.pad_id,
+        text_ctc_pad_id=character_vocab.blank_id,
         sample_rate=int(data_cfg.get("sample_rate", 16000)),
         feature_padding=str(train_cfg.get("feature_padding", "max_length")),
         feature_pad_to_multiple_of=(
@@ -193,6 +196,8 @@ def build_components(
     model = WhisperTWModel(
         config=config,
         vocab_size=tokenizer.vocab_size,
+        text_ctc_vocab_size=character_vocab.size,
+        text_ctc_pad_id=character_vocab.blank_id,
         bopomofo_vocab_size=bopomofo_vocab.size,
         text_pad_id=tokenizer.pad_id,
     )
@@ -303,11 +308,18 @@ def configure_training_runtime(train_cfg: dict[str, Any], device: torch.device) 
 def build_scheduler(
     optimizer: torch.optim.Optimizer,
     train_cfg: dict[str, Any],
-) -> torch.optim.lr_scheduler.ReduceLROnPlateau | None:
+) -> torch.optim.lr_scheduler.ReduceLROnPlateau | torch.optim.lr_scheduler.CosineAnnealingWarmRestarts | None:
     scheduler_cfg = train_cfg.get("scheduler", {})
     scheduler_type = str(scheduler_cfg.get("type", "none")).lower()
     if scheduler_type in {"none", "off", "disabled"}:
         return None
+    if scheduler_type in {"cosine_warm_restarts", "warmup_cosine_restarts"}:
+        return torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=int(scheduler_cfg.get("t_0", 4)),
+            T_mult=int(scheduler_cfg.get("t_mult", 2)),
+            eta_min=float(scheduler_cfg.get("eta_min", 1e-6)),
+        )
     if scheduler_type not in {"reduce_on_plateau", "warmup_reduce_on_plateau"}:
         raise ValueError(f"Unsupported scheduler type: {scheduler_type}")
     return torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -353,12 +365,54 @@ class WarmupReduceOnPlateau:
             self.plateau_scheduler.step(metric)
 
 
+class WarmupCosineRestarts:
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        cosine_scheduler: torch.optim.lr_scheduler.CosineAnnealingWarmRestarts,
+        warmup_epochs: int,
+        warmup_start_factor: float,
+    ) -> None:
+        self.optimizer = optimizer
+        self.cosine_scheduler = cosine_scheduler
+        self.warmup_epochs = max(warmup_epochs, 0)
+        self.warmup_start_factor = max(min(warmup_start_factor, 1.0), 0.0)
+        for group in self.optimizer.param_groups:
+            group["target_lr"] = float(group["lr"])
+            if self.warmup_epochs > 0:
+                group["lr"] = float(group["target_lr"]) * self.warmup_start_factor
+
+    def step(self, metric: float | None, epoch: int) -> None:
+        if self.warmup_epochs > 0 and epoch <= self.warmup_epochs:
+            progress = epoch / self.warmup_epochs
+            factor = self.warmup_start_factor + (
+                1.0 - self.warmup_start_factor
+            ) * progress
+            for group in self.optimizer.param_groups:
+                group["lr"] = float(group["target_lr"]) * factor
+            return
+        self.cosine_scheduler.step(max(epoch - self.warmup_epochs, 0))
+
+
 def build_lr_controller(
     optimizer: torch.optim.Optimizer,
     train_cfg: dict[str, Any],
-) -> WarmupReduceOnPlateau | torch.optim.lr_scheduler.ReduceLROnPlateau | None:
+) -> WarmupReduceOnPlateau | WarmupCosineRestarts | torch.optim.lr_scheduler.ReduceLROnPlateau | torch.optim.lr_scheduler.CosineAnnealingWarmRestarts | None:
     scheduler_cfg = train_cfg.get("scheduler", {})
     scheduler_type = str(scheduler_cfg.get("type", "none")).lower()
+    if scheduler_type == "warmup_cosine_restarts":
+        cosine_scheduler = build_scheduler(optimizer, train_cfg)
+        if not isinstance(
+            cosine_scheduler,
+            torch.optim.lr_scheduler.CosineAnnealingWarmRestarts,
+        ):
+            raise RuntimeError("warmup_cosine_restarts requires cosine scheduler.")
+        return WarmupCosineRestarts(
+            optimizer=optimizer,
+            cosine_scheduler=cosine_scheduler,
+            warmup_epochs=int(scheduler_cfg.get("warmup_epochs", 1)),
+            warmup_start_factor=float(scheduler_cfg.get("warmup_start_factor", 0.3)),
+        )
     if scheduler_type != "warmup_reduce_on_plateau":
         return build_scheduler(optimizer, train_cfg)
     plateau_scheduler = build_scheduler(optimizer, train_cfg)
@@ -379,6 +433,10 @@ def get_validation_monitor_value(
         "loss": "loss",
         "val_text_loss": "text_loss",
         "text_loss": "text_loss",
+        "val_text_ctc_loss": "text_ctc_loss",
+        "text_ctc_loss": "text_ctc_loss",
+        "val_correction_loss": "correction_loss",
+        "correction_loss": "correction_loss",
         "val_bopomofo_ctc_loss": "bopomofo_ctc_loss",
         "bopomofo_ctc_loss": "bopomofo_ctc_loss",
     }
@@ -461,6 +519,66 @@ def autocast_context(
     return torch.amp.autocast(**autocast_kwargs)
 
 
+def apply_feature_spec_augment(
+    input_features: torch.Tensor,
+    train_cfg: dict[str, Any],
+) -> torch.Tensor:
+    spec_cfg = train_cfg.get("feature_spec_augment", {})
+    if not bool(spec_cfg.get("enabled", False)):
+        return input_features
+    augmented = input_features.clone()
+    batch_size, num_mels, num_frames = augmented.shape
+    freq_masks = int(spec_cfg.get("freq_masks", 2))
+    max_freq_width = int(spec_cfg.get("max_freq_width", 8))
+    time_masks = int(spec_cfg.get("time_masks", 2))
+    max_time_width = int(spec_cfg.get("max_time_width", 80))
+    mask_value = float(spec_cfg.get("mask_value", 0.0))
+
+    for batch_index in range(batch_size):
+        for _ in range(freq_masks):
+            width = int(
+                torch.randint(
+                    low=0,
+                    high=max(max_freq_width, 1) + 1,
+                    size=(1,),
+                    device=augmented.device,
+                ).item()
+            )
+            if width <= 0 or width >= num_mels:
+                continue
+            start = int(
+                torch.randint(
+                    low=0,
+                    high=num_mels - width + 1,
+                    size=(1,),
+                    device=augmented.device,
+                ).item()
+            )
+            augmented[batch_index, start : start + width, :] = mask_value
+
+        for _ in range(time_masks):
+            width = int(
+                torch.randint(
+                    low=0,
+                    high=max(max_time_width, 1) + 1,
+                    size=(1,),
+                    device=augmented.device,
+                ).item()
+            )
+            if width <= 0 or width >= num_frames:
+                continue
+            start = int(
+                torch.randint(
+                    low=0,
+                    high=num_frames - width + 1,
+                    size=(1,),
+                    device=augmented.device,
+                ).item()
+            )
+            augmented[batch_index, :, start : start + width] = mask_value
+    return augmented
+
+
 def shutdown_dataloader_workers(dataloader: DataLoader) -> None:
     iterator = getattr(dataloader, "_iterator", None)
     if iterator is None:
@@ -488,6 +606,8 @@ def val_loss(
     model.eval()
     total_loss = 0.0
     total_text_loss = 0.0
+    total_text_ctc_loss = 0.0
+    total_correction_loss = 0.0
     total_ctc_loss = 0.0
     total_batches = 0
 
@@ -504,6 +624,7 @@ def val_loss(
                 input_features=batch["input_features"],
                 decoder_input_ids=batch["decoder_input_ids"],
                 labels=batch["labels"],
+                text_ctc_labels=batch["text_ctc_labels"],
                 bopomofo_labels=batch["bopomofo_labels"],
                 bopomofo_label_lengths=batch["bopomofo_label_lengths"],
             )
@@ -513,6 +634,16 @@ def val_loss(
         total_text_loss += (
             float(output.text_loss.detach().cpu())
             if output.text_loss is not None
+            else 0.0
+        )
+        total_text_ctc_loss += (
+            float(output.text_ctc_loss.detach().cpu())
+            if output.text_ctc_loss is not None
+            else 0.0
+        )
+        total_correction_loss += (
+            float(output.correction_loss.detach().cpu())
+            if output.correction_loss is not None
             else 0.0
         )
         total_ctc_loss += (
@@ -528,6 +659,8 @@ def val_loss(
     return {
         "loss": total_loss / denom,
         "text_loss": total_text_loss / denom,
+        "text_ctc_loss": total_text_ctc_loss / denom,
+        "correction_loss": total_correction_loss / denom,
         "bopomofo_ctc_loss": total_ctc_loss / denom,
     }
 
@@ -551,6 +684,7 @@ def train(config: dict[str, Any], max_samples: int | None = None) -> Path:
                 config["tokenizer"]["model_path"]
             ),
             bopomofo_vocab=BopomofoVocab.default(),
+            character_vocab=CharacterVocab.build_from_config(config),
             sample_rate=int(config["data"].get("sample_rate", 16000)),
             max_audio_seconds=float(config["data"].get("max_audio_seconds", 30.0)),
             max_samples=max_samples,
@@ -621,6 +755,8 @@ def train(config: dict[str, Any], max_samples: int | None = None) -> Path:
         for epoch in range(1, num_epochs + 1):
             epoch_loss = 0.0
             epoch_text_loss = 0.0
+            epoch_text_ctc_loss = 0.0
+            epoch_correction_loss = 0.0
             epoch_ctc_loss = 0.0
             epoch_batches = 0
             optimizer.zero_grad(set_to_none=True)
@@ -635,13 +771,19 @@ def train(config: dict[str, Any], max_samples: int | None = None) -> Path:
             )
             total_train_batches = len(train_dataloader)
             log_every = max(int(train_cfg.get("log_every", 10)), 1)
+            grad_clip_norm = float(train_cfg.get("grad_clip_norm", 0.0))
             for batch_index, batch in enumerate(train_progress, start=1):
                 batch = move_batch_to_device(batch, device)
+                batch["input_features"] = apply_feature_spec_augment(
+                    batch["input_features"],
+                    train_cfg,
+                )
                 with autocast_context(device, amp_enabled, amp_dtype):
                     output = model(
                         input_features=batch["input_features"],
                         decoder_input_ids=batch["decoder_input_ids"],
                         labels=batch["labels"],
+                        text_ctc_labels=batch["text_ctc_labels"],
                         bopomofo_labels=batch["bopomofo_labels"],
                         bopomofo_label_lengths=batch["bopomofo_label_lengths"],
                     )
@@ -654,6 +796,12 @@ def train(config: dict[str, Any], max_samples: int | None = None) -> Path:
                     or batch_index == total_train_batches
                 )
                 if should_step:
+                    if grad_clip_norm > 0.0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            unwrap_model(model).parameters(),
+                            grad_clip_norm,
+                        )
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad(set_to_none=True)
@@ -670,7 +818,19 @@ def train(config: dict[str, Any], max_samples: int | None = None) -> Path:
                     if output.bopomofo_ctc_loss is not None
                     else float("nan")
                 )
+                text_ctc_loss = (
+                    output.text_ctc_loss.item()
+                    if output.text_ctc_loss is not None
+                    else float("nan")
+                )
+                correction_loss = (
+                    output.correction_loss.item()
+                    if output.correction_loss is not None
+                    else float("nan")
+                )
                 epoch_text_loss += float(text_loss)
+                epoch_text_ctc_loss += float(text_ctc_loss)
+                epoch_correction_loss += float(correction_loss)
                 epoch_ctc_loss += float(ctc_loss)
                 if batch_index == 1 or batch_index % log_every == 0:
                     logger.log_message(
@@ -679,6 +839,8 @@ def train(config: dict[str, Any], max_samples: int | None = None) -> Path:
                             f"progress={batch_index / max(total_train_batches, 1) * 100.0:.2f}% "
                             f"loss={float(output.loss.detach().cpu()):.4f} "
                             f"text_loss={float(text_loss):.4f} "
+                            f"text_ctc_loss={float(text_ctc_loss):.4f} "
+                            f"correction_loss={float(correction_loss):.4f} "
                             f"bopomofo_ctc_loss={float(ctc_loss):.4f}"
                         ),
                         epoch=epoch,
@@ -694,6 +856,8 @@ def train(config: dict[str, Any], max_samples: int | None = None) -> Path:
                 )
             train_loss = epoch_loss / max(epoch_batches, 1)
             train_text_loss = epoch_text_loss / max(epoch_batches, 1)
+            train_text_ctc_loss = epoch_text_ctc_loss / max(epoch_batches, 1)
+            train_correction_loss = epoch_correction_loss / max(epoch_batches, 1)
             train_ctc_loss = epoch_ctc_loss / max(epoch_batches, 1)
             shutdown_nonpersistent_dataloader_workers(train_dataloader)
             val_metrics = val_loss(
@@ -714,8 +878,16 @@ def train(config: dict[str, Any], max_samples: int | None = None) -> Path:
                 checkpoint_monitor,
             )
             if scheduler is not None:
-                if isinstance(scheduler, WarmupReduceOnPlateau):
+                if isinstance(
+                    scheduler,
+                    (WarmupReduceOnPlateau, WarmupCosineRestarts),
+                ):
                     scheduler.step(scheduler_metric, epoch)
+                elif isinstance(
+                    scheduler,
+                    torch.optim.lr_scheduler.CosineAnnealingWarmRestarts,
+                ):
+                    scheduler.step(epoch)
                 else:
                     scheduler.step(scheduler_metric)
             current_lr = float(optimizer.param_groups[0]["lr"])
@@ -726,15 +898,17 @@ def train(config: dict[str, Any], max_samples: int | None = None) -> Path:
             )
             scheduler_phase = (
                 "warmup"
-                if isinstance(scheduler, WarmupReduceOnPlateau)
+                if isinstance(scheduler, (WarmupReduceOnPlateau, WarmupCosineRestarts))
                 and scheduler.warmup_epochs > 0
                 and epoch <= scheduler.warmup_epochs
-                else "plateau"
+                else str(scheduler_cfg.get("type", "none")).lower()
             )
             epoch_summary_message = (
                 f"epoch={epoch} train_loss={train_loss:.4f} "
                 f"val_loss={val_metrics['loss']:.4f} "
                 f"val_text_loss={val_metrics['text_loss']:.4f} "
+                f"val_text_ctc_loss={val_metrics['text_ctc_loss']:.4f} "
+                f"val_correction_loss={val_metrics['correction_loss']:.4f} "
                 f"val_bopomofo_ctc_loss={val_metrics['bopomofo_ctc_loss']:.4f} "
                 f"scheduler_monitor={scheduler_monitor}:{scheduler_metric:.4f} "
                 f"early_monitor={early_monitor}:{early_metric:.4f} "
@@ -753,6 +927,10 @@ def train(config: dict[str, Any], max_samples: int | None = None) -> Path:
                     "val_loss": val_metrics["loss"],
                     "train_text_loss": train_text_loss,
                     "val_text_loss": val_metrics["text_loss"],
+                    "train_text_ctc_loss": train_text_ctc_loss,
+                    "val_text_ctc_loss": val_metrics["text_ctc_loss"],
+                    "train_correction_loss": train_correction_loss,
+                    "val_correction_loss": val_metrics["correction_loss"],
                     "train_bopomofo_ctc_loss": train_ctc_loss,
                     "val_bopomofo_ctc_loss": val_metrics["bopomofo_ctc_loss"],
                     "scheduler_monitor_value": scheduler_metric,

@@ -14,6 +14,7 @@ from tqdm.auto import tqdm
 from transformers import WhisperFeatureExtractor
 
 from .bopomofo import BopomofoVocab
+from .config import resolve_common_voice_split_source
 from .text_normalization import TextNormalizer, build_text_normalizer
 from .tokenizer import SentencePieceTextTokenizer
 
@@ -107,27 +108,6 @@ def build_audio_augmentor(
     )
 
 
-def resolve_common_voice_split_source(
-    data_cfg: dict[str, Any],
-    split: str,
-) -> str | Path:
-    split_paths = data_cfg.get("split_paths", {})
-    if isinstance(split_paths, dict):
-        split_source = split_paths.get(split)
-        if split_source:
-            return split_source
-
-    split_tsv_key = f"{split}_tsv"
-    if data_cfg.get(split_tsv_key):
-        return data_cfg[split_tsv_key]
-
-    split_name_key = f"{split}_split"
-    if data_cfg.get(split_name_key):
-        return data_cfg[split_name_key]
-
-    return split
-
-
 def read_common_voice_split(
     data_root: str | Path,
     split: str | Path,
@@ -189,6 +169,7 @@ class CommonVoiceTaiwanDataset(Dataset):
         split: str,
         text_tokenizer: SentencePieceTextTokenizer,
         bopomofo_vocab: BopomofoVocab,
+        character_vocab: Any | None = None,
         sample_rate: int = 16000,
         max_audio_seconds: float = 30.0,
         max_samples: int | None = None,
@@ -206,6 +187,7 @@ class CommonVoiceTaiwanDataset(Dataset):
             self.samples = self.samples[:max_samples]
         self.text_tokenizer = text_tokenizer
         self.bopomofo_vocab = bopomofo_vocab
+        self.character_vocab = character_vocab
         self.sample_rate = sample_rate
         self.max_audio_samples = int(sample_rate * max_audio_seconds)
         self.text_normalizer = text_normalizer
@@ -233,17 +215,30 @@ class CommonVoiceTaiwanDataset(Dataset):
                 self.bopomofo_vocab.encode(normalized_text), dtype=torch.long
             ),
         }
+        if self.character_vocab is not None:
+            item["text_ctc_ids"] = torch.tensor(
+                self.character_vocab.encode(normalized_text), dtype=torch.long
+            )
         if self.feature_cache_dir is not None:
             variant_index = 0
             if self.sample_cached_variant and self.feature_cache_variants > 1:
                 variant_index = random.randrange(self.feature_cache_variants)
-            cache_path = build_feature_cache_path(
-                self.feature_cache_dir,
-                split=self.split,
-                rel_path=sample.rel_path,
-                variant_index=variant_index,
-            )
-            if cache_path.exists():
+            candidate_variants = [variant_index]
+            if self.feature_cache_variants > 1:
+                candidate_variants.extend(
+                    idx
+                    for idx in range(self.feature_cache_variants)
+                    if idx != variant_index
+                )
+            for candidate_variant in candidate_variants:
+                cache_path = build_feature_cache_path(
+                    self.feature_cache_dir,
+                    split=self.split,
+                    rel_path=sample.rel_path,
+                    variant_index=candidate_variant,
+                )
+                if not cache_path.exists():
+                    continue
                 cached = torch.load(cache_path, map_location="cpu", weights_only=False)
                 item["input_features"] = cached["input_features"]
                 item["audio"] = None
@@ -265,6 +260,7 @@ class WhisperTWCollator:
         feature_extractor: WhisperFeatureExtractor,
         text_pad_id: int,
         bopomofo_pad_id: int,
+        text_ctc_pad_id: int | None = None,
         sample_rate: int = 16000,
         feature_padding: str = "max_length",
         feature_pad_to_multiple_of: int | None = None,
@@ -272,6 +268,7 @@ class WhisperTWCollator:
         self.feature_extractor = feature_extractor
         self.text_pad_id = text_pad_id
         self.bopomofo_pad_id = bopomofo_pad_id
+        self.text_ctc_pad_id = text_ctc_pad_id
         self.sample_rate = sample_rate
         self.feature_padding = feature_padding
         self.feature_pad_to_multiple_of = feature_pad_to_multiple_of
@@ -306,10 +303,20 @@ class WhisperTWCollator:
             batch_first=True,
             padding_value=self.bopomofo_pad_id,
         )
+        text_ctc_ids = None
+        if self.text_ctc_pad_id is not None and all(
+            item.get("text_ctc_ids") is not None for item in batch
+        ):
+            text_ctc_ids = torch.nn.utils.rnn.pad_sequence(
+                [item["text_ctc_ids"] for item in batch],
+                batch_first=True,
+                padding_value=self.text_ctc_pad_id,
+            )
         return {
             "input_features": input_features,
             "decoder_input_ids": text_ids[:, :-1],
             "labels": text_ids[:, 1:],
+            "text_ctc_labels": text_ctc_ids,
             "bopomofo_labels": bopomofo_ids,
             "bopomofo_label_lengths": torch.tensor(
                 [
